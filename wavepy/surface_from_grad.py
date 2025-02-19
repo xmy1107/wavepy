@@ -109,6 +109,8 @@ from __future__ import (absolute_import, division, print_function,
 import numpy as np
 import matplotlib.pyplot as plt
 import wavepy.utils as wpu
+import torch
+import torch.fft
 
 __authors__ = "Walan Grizolli"
 __copyright__ = "Copyright (c) 2016-2017, Argonne National Laboratory"
@@ -117,7 +119,7 @@ __docformat__ = "restructuredtext en"
 __all__ = ['frankotchellappa', 'error_integration']
 
 
-def frankotchellappa(del_f_del_x, del_f_del_y, reflec_pad=True):
+def frankotchellappa(del_f_del_x, del_f_del_y, reflec_pad=True, device='cuda'):
     """
 
     The simplest method is the so-called Frankot-Chelappa method. The idea
@@ -266,32 +268,37 @@ def frankotchellappa(del_f_del_x, del_f_del_y, reflec_pad=True):
 
 
     """
-
-    from numpy.fft import fft2, ifft2, fftfreq
+    del_f_del_x = torch.tensor(del_f_del_x, dtype = torch.float32, device=device)
+    del_f_del_y = torch.tensor(del_f_del_y, dtype = torch.float32, device=device)
 
     if reflec_pad:
-        del_f_del_x, del_f_del_y = _reflec_pad_grad_fields(del_f_del_x,
-                                                           del_f_del_y)
+        del_f_del_x, del_f_del_y = _reflec_pad_grad_fields(del_f_del_x, del_f_del_y, device)
 
     NN, MM = del_f_del_x.shape
-    wx, wy = np.meshgrid(fftfreq(MM) * 2 * np.pi,
-                         fftfreq(NN) * 2 * np.pi, indexing='xy')
-    # by using fftfreq there is no need to use fftshift
+    # Create frequency grids
+    wx, wy = torch.meshgrid(torch.fft.fftfreq(MM, 1), torch.fft.fftfreq(NN, 1), indexing='xy')
 
-    numerator = -1j * wx * fft2(del_f_del_x) - 1j * wy * fft2(del_f_del_y)
+    # Scale by 2*pi for correct Fourier transform units
+    wx, wy = wx * 2 * np.pi, wy * 2 * np.pi
 
-    denominator = (wx) ** 2 + (wy) ** 2 + np.finfo(float).eps
+    # Perform FFT
+    del_f_del_x_fft = torch.fft.fft2(del_f_del_x)
+    del_f_del_y_fft = torch.fft.fft2(del_f_del_y)
 
-    res = ifft2(numerator / denominator)
-    res -= np.mean(np.real(res))
+    numerator = -1j * wx * del_f_del_x_fft - 1j * wy * del_f_del_y_fft
+    denominator = wx**2 + wy**2 + torch.finfo(torch.float32).eps
+
+    res = torch.fft.ifft2(numerator / denominator)
+
+    # Remove DC component by subtracting mean
+    res = res - torch.mean(torch.real(res))
 
     if reflec_pad:
         return _one_forth_of_array(res)
     else:
         return res
 
-
-def _reflec_pad_grad_fields(del_func_x, del_func_y):
+def _reflec_pad_grad_fields(del_func_x, del_func_y, device='cuda'):
     """
 
     This fucntion pad the gradient field in order to obtain a 2-dimensional
@@ -305,23 +312,13 @@ def _reflec_pad_grad_fields(del_func_x, del_func_y):
 
     """
 
-    del_func_x_c1 = np.concatenate((del_func_x,
-                                    del_func_x[::-1, :]), axis=0)
+    del_func_x = torch.cat([del_func_x, del_func_x.flip(0)], dim=0)
+    del_func_x = torch.cat([del_func_x, del_func_x.flip(1)], dim=1)
 
-    del_func_x_c2 = np.concatenate((-del_func_x[:, ::-1],
-                                    -del_func_x[::-1, ::-1]), axis=0)
+    del_func_y = torch.cat([del_func_y, -del_func_y.flip(0)], dim=0)
+    del_func_y = torch.cat([del_func_y, -del_func_y.flip(1)], dim=1)
 
-    del_func_x = np.concatenate((del_func_x_c1, del_func_x_c2), axis=1)
-
-    del_func_y_c1 = np.concatenate((del_func_y,
-                                    -del_func_y[::-1, :]), axis=0)
-
-    del_func_y_c2 = np.concatenate((del_func_y[:, ::-1],
-                                    -del_func_y[::-1, ::-1]), axis=0)
-
-    del_func_y = np.concatenate((del_func_y_c1, del_func_y_c2), axis=1)
-
-    return del_func_x, del_func_y
+    return del_func_x.to(device), del_func_y.to(device)
 
 
 def _one_forth_of_array(array):
@@ -331,76 +328,70 @@ def _one_forth_of_array(array):
 
     """
 
-    array, _ = np.array_split(array, 2, axis=0)
-    return np.array_split(array, 2, axis=1)[0]
+    array = array.chunk(2, dim=0)[0]
+    return array.chunk(2, dim=1)[0]
 
 
 def _grad(func):
 
-    del_func_2d_x = np.diff(func, axis=1)
-    del_func_2d_x = np.pad(del_func_2d_x, ((0, 0), (1, 0)), 'edge')
+    del_func_2d_x = torch.diff(func, dim=1)
+    del_func_2d_x = torch.cat([del_func_2d_x, del_func_2d_x[:, -1:]], dim=1)
 
-    del_func_2d_y = np.diff(func, axis=0)
-    del_func_2d_y = np.pad(del_func_2d_y, ((1, 0), (0, 0)), 'edge')
+    del_func_2d_y = torch.diff(func, dim=0)
+    del_func_2d_y = torch.cat([del_func_2d_y, del_func_2d_y[-1:, :]], dim=0)
 
     return del_func_2d_x, del_func_2d_y
 
 
 def error_integration(del_f_del_x, del_f_del_y, func,
                       pixelsize, errors=False,
-                      shifthalfpixel=False, plot_flag=True):
+                      shifthalfpixel=False, plot_flag=True, device='cuda'):
 
-    func = np.real(func)
+    func = torch.real(func)
 
     if shifthalfpixel:
         func = wpu.shift_subpixel_2d(func, 2)
 
-    xx, yy = wpu.realcoordmatrix(func.shape[1], pixelsize[1],
-                                 func.shape[0], pixelsize[0])
+    # Create coordinate matrices
+    xx, yy = wpu.realcoordmatrix(func.shape[1], pixelsize[1], func.shape[0], pixelsize[0])
     midleX = xx.shape[0] // 2
     midleY = xx.shape[1] // 2
 
     grad_x, grad_y = _grad(func)
 
-    grad_x -= np.mean(grad_x)
-    grad_y -= np.mean(grad_y)
-    del_f_del_x -= np.mean(del_f_del_x)
-    del_f_del_y -= np.mean(del_f_del_y)
+    grad_x -= torch.mean(grad_x)
+    grad_y -= torch.mean(grad_y)
+    del_f_del_x -= torch.mean(del_f_del_x)
+    del_f_del_y -= torch.mean(del_f_del_y)
 
-    amp_x = np.max(del_f_del_x) - np.min(del_f_del_x)
-    amp_y = np.max(del_f_del_y) - np.min(del_f_del_y)
+    amp_x = torch.max(del_f_del_x) - torch.min(del_f_del_x)
+    amp_y = torch.max(del_f_del_y) - torch.min(del_f_del_y)
 
-    error_x = np.abs(grad_x - del_f_del_x)/amp_x*100
-    error_y = np.abs(grad_y - del_f_del_y)/amp_y*100
+    error_x = torch.abs(grad_x - del_f_del_x) / amp_x * 100
+    error_y = torch.abs(grad_y - del_f_del_y) / amp_y * 100
 
     if plot_flag:
         plt.figure(figsize=(14, 10))
 
         ax1 = plt.subplot(221)
         ax1.ticklabel_format(style='sci', axis='both', scilimits=(0, 1))
-        ax1.plot(xx[midleX, :], del_f_del_x[midleX, :], '-kx',
-                 markersize=10, label='dx data')
-        ax1.plot(xx[midleX, :], grad_x[midleX, :], '-r+',
-                 markersize=10, label='dx reconstructed')
+        ax1.plot(xx[midleX, :], del_f_del_x[midleX, :].cpu().numpy(), '-kx', markersize=10, label='dx data')
+        ax1.plot(xx[midleX, :], grad_x[midleX, :].cpu().numpy(), '-r+', markersize=10, label='dx reconstructed')
         ax1.legend()
 
         ax2 = plt.subplot(223, sharex=ax1)
-        ax2.plot(xx[midleX, :],
-                 error_x[midleX, :], '-g.', label='error x')
-        plt.title(r'$\mu$ = {:.2g}'.format(np.mean(error_x[midleX, :])))
+        ax2.plot(xx[midleX, :], error_x[midleX, :].cpu().numpy(), '-g.', label='error x')
+        plt.title(r'$\mu$ = {:.2g}'.format(torch.mean(error_x[midleX, :]).cpu().numpy()))
         ax2.legend()
 
         ax3 = plt.subplot(222, sharex=ax1, sharey=ax1)
-        ax3.plot(yy[:, midleY], del_f_del_y[:, midleY], '-kx',
-                 markersize=10, label='dy data')
-        ax3.plot(yy[:, midleY], grad_y[:, midleY], '-r+',
-                 markersize=10, label='dy reconstructed')
+        ax3.plot(yy[:, midleY], del_f_del_y[:, midleY].cpu().numpy(), '-kx', markersize=10, label='dy data')
+        ax3.plot(yy[:, midleY], grad_y[:, midleY].cpu().numpy(), '-r+', markersize=10, label='dy reconstructed')
         ax3.legend()
 
         ax4 = plt.subplot(224, sharex=ax1, sharey=ax2)
-        ax4.plot(yy[:, midleY],
-                 error_y[:, midleY], '-g.', label='error y')
-        plt.title(r'$\mu$ = {:.2g}'.format(np.mean(error_y[:, midleY])))
+        ax4.plot(yy[:, midleY], error_y[:, midleY].cpu().numpy(), '-g.', label='error y')
+        plt.title(r'$\mu$ = {:.2g}'.format(torch.mean(error_y[:, midleY]).cpu().numpy()))
         ax4.legend()
 
         plt.suptitle('Error integration', fontsize=22)
